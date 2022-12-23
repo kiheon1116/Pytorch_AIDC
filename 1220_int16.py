@@ -20,25 +20,8 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+
 np.set_printoptions(threshold=np.inf, linewidth=np.inf)
-
-import matplotlib.pyplot as plt 
-import numpy as np 
-from scipy.stats import norm 
-
-def plt(x):
-    plt.figure(figsize=(15,10))
-    plt.title('Standard Normal Distribution') 
-    plt.xlabel('x') 
-    plt.ylabel('f(x)')
-    plt.grid()
-    plt.plot(x, norm.pdf(x, loc=0, scale=1))
-    plt.show()
-
-
-
-
-
 
 # input : tensor(numpy array)[-1,64] --> output : flag(numpy array)[]
 # (block(16word * 64) * n개) => [-1,64], 1개당 int16
@@ -233,7 +216,8 @@ def BPC(input, length):
      mask_all_zero_2_sum = np.sum((mask_all_zero_2 ^ mask_all_zero_2_left), axis=1)//2
      
      result_sum = np.sum(result_flag, axis=1) + mask_all_zero_2_sum*int(6)
-     result = (result_sum <= (length*16-18)) # 64기준 length*16-18 = 512-18 
+     result = (result_sum <= ((length/2)*16-18)) # 64기준 length*16-18 = 512-18 
+     
      # 494,  558, 622, 686, 750, 814, 878, 942
      # 8bit -> 2:1(512), 7bit -> 16:9(576), 6bit -> 16:10(640),  5bit -> 16:11(704), 
      # 4bit -> 16:12(768), 3bit -> 16:13(832), 2bit -> 16:14(896), 1bit -> 16:15(960)
@@ -258,41 +242,57 @@ def Comp(x_tensor : torch.Tensor, length):      # Tensor (128,3,224,224) -> Tens
     # print('bpc_flag : ', np.sum(bpc_flag.astype(np.int32)) / len(bpc_flag.reshape(-1,)))
     return sr_flag | zrle_flag | bpc_flag.reshape(-1,1)
 
-def rolling(flag, x_numpy):
-    lossy_result = x_numpy*(~flag)
-    print("lossy result",lossy_result.shape, lossy_result.dtype)
-    rolling_0 = (((lossy_result >= 0x0000) & (lossy_result < 128)) | ((lossy_result <= -128) & (lossy_result > -256)))#.view(np.int16)
-    rolling_1 = (((lossy_result >= 128) & (lossy_result < 256)) | ((lossy_result <= -256) & (lossy_result > -512)))#.view(np.int16)
-    rolling_2 = (((lossy_result >= 256) & (lossy_result < 512)) | ((lossy_result <= -512) & (lossy_result > -1024)))#.view(np.int16)
-    rolling_3 = (((lossy_result >= 512) & (lossy_result < 1024)) | ((lossy_result <= -1024) & (lossy_result > -2048)))#.view(np.int16)
-    rolling_4 = (((lossy_result >= 1024) & (lossy_result < 2048)) | ((lossy_result <= -2048) & (lossy_result > -4096)))#.view(np.int16)
-    rolling_5 = (((lossy_result >= 2048) & (lossy_result < 4096)) | ((lossy_result <= -4096) & (lossy_result > -8192)))#.view(np.int16)
-    rolling_6 = (((lossy_result >= 4096) & (lossy_result < 8192)) | ((lossy_result <= -8192) & (lossy_result > -16384)))#.view(np.int16)
-    rolling_7 = (((lossy_result >= 8192) & (lossy_result < 16384)) | ((lossy_result <= -16384) & (lossy_result > -32768)))#.view(np.int16)
-    rolling_8 = (((lossy_result >= 16384) & (lossy_result < 32768)) | ((lossy_result <= -32768) & (lossy_result > -65536)))#.view(np.int16)
-    rolling_9 = (((lossy_result >= 32768) & (lossy_result < 65536)) | (lossy_result <= -65536) )#.view(np.int16)
 
-    INT7_index = rolling_0*0+rolling_1*1+rolling_2*2+rolling_3*3+rolling_4*4+rolling_5*5+rolling_6*6+rolling_7*7+rolling_8*8+rolling_9*9
-    print(INT7_index[0],INT7_index.dtype,INT7_index.shape)
-    average_index_result = np.sum(INT7_index, axis=1) / 32
-    
-    print(average_index_result.shape, average_index_result[1:5])
-    # # print(INT7_index,INT7_index.shape, INT7_index.dtype)
-    # INT7_index_int4 = INT7_index.view(np.int8)
-    # # print(INT7_index_int4.shape, INT7_index_int4.dtype)
-    
-    INT7 = rolling_0&0x007f+rolling_1&0x00fe+rolling_2&0x01fc+rolling_3&0x03f8+rolling_4&0x07f0+rolling_5&0x0fe0+rolling_6&0x1fc0+rolling_7&0x3f80+rolling_8&0x7f00+rolling_9&0xfe00
-    return INT7.view(np.int16)
+
+# 0000 0000 0111 1111 ~ 0 / 1111 1111 1000 0000 ~ 1111 1111 1011 1111 (-128 ~ -65)
+# 0000 0000 0111 1111 ~ 0 / 1111 1111 0000 0000 ~ 1111 1111 0111 1111 (-256 ~ -129)
+# 0000 0000 0111 1111 ~ 0 / 1111 1110 0000 0000 ~ 1111 1110 1111 1111 (-512 ~ -257)
+# 0000 0000 0111 1111 ~ 0 / 1111 1100 0000 0000 ~ 1111 1101 1111 1111
+# 0000 0000 0111 1111 ~ 0 / 1111 1000 0000 0000 ~ 1111 1011 1111 1111
+
+def rolling_window(lossy_result,length, count):  
+    rolling_plus = (lossy_result >= 2**(length+count)) & (lossy_result < 2**(length+count+1)) # 0 ~ 127
+    rolling_minus = (lossy_result < -(2**(length+count))) & (lossy_result >= -(2**(length+1 + count))) # -128 ~ -65 
+    return rolling_plus+rolling_minus
+
+def rolling(flag, x_numpy,length):
+    # print("x_numpy",x_numpy.shape)
+    lossy_result = x_numpy*(~flag)
+
+    # print(lossy_result[1:5])
+    rolling_0 = (((lossy_result >= 0x0000) & (lossy_result < 2**(length))) | ((lossy_result < -(2**(length-1))) & (lossy_result >= -2**(length))))
+    rolling_1 = rolling_window(lossy_result, length, 0)
+    rolling_2 = rolling_window(lossy_result, length, 1)
+    rolling_3 = rolling_window(lossy_result, length, 2)
+    rolling_4 = rolling_window(lossy_result, length, 3)
+    rolling_5 = rolling_window(lossy_result, length, 4)
+    rolling_6 = rolling_window(lossy_result, length, 5)
+    rolling_7 = rolling_window(lossy_result, length, 6)
+    rolling_8 = rolling_window(lossy_result, length, 7)
+    rolling_9 = rolling_window(lossy_result, length, 8)
+        
+    INT7_index  = (rolling_0*0x007f) + (rolling_1*0x00fe) + (rolling_2*0x01fc) + (rolling_3*0x03f8) + (rolling_4*0x07f0) + (rolling_5*0x0fe0) + (rolling_6*0x1fc0) + (rolling_7*0x3f80) + (rolling_8*0x7f00) + (rolling_9*0xfe00)
+    INT8_index  = (rolling_0*0x00ff ) + (rolling_1*0x01fe) + (rolling_2*0x03fc) + (rolling_3*0x07f8) + (rolling_4*0x0ff0) + (rolling_5*0x1fe0) + (rolling_6*0x3fc0) + (rolling_7*0x7f80) + (rolling_8*0xff00)                      
+    INT9_index  = (rolling_0*0x01ff ) + (rolling_1*0x03fe) + (rolling_2*0x07fc) + (rolling_3*0x0ff8) + (rolling_4*0x1ff0) + (rolling_5*0x3fe0) + (rolling_6*0x7fc0) + (rolling_7*0xff80)
+    INT10_index = (rolling_0*0x03ff) + (rolling_1*0x07fe) + (rolling_2*0x0ffc) + (rolling_3*0x1ff8) + (rolling_4*0x3ff0) + (rolling_5*0x7fe0) + (rolling_6*0xffc0)
+    INT11_index = (rolling_0*0x07ff) + (rolling_1*0x0ffe) + (rolling_2*0x1ffc) + (rolling_3*0x3ff8) + (rolling_4*0x7ff0) + (rolling_5*0xffe0)
+    INT12_index = (rolling_0*0x0fff) + (rolling_1*0x1ffe) + (rolling_2*0x3ffc) + (rolling_3*0x7ff8) + (rolling_4*0xfff0)
+    INT13_index = (rolling_0*0x1fff) + (rolling_1*0x3ffe) + (rolling_2*0x7ffc) + (rolling_3*0xfff8)
+    INT14_index = (rolling_0*0x3fff) + (rolling_1*0x7ffe) + (rolling_2*0xfffc)
+    INT15_index = (rolling_0*0x7fff) + (rolling_1*0xfffe) 
+        
+    return INT7_index.astype(np.int16)
      
 
 # mask = [0x80,0xC0,0xE0,0xF0,0xF8,0xFC,0xFE,0xFF]
 def Decomp(flag,x_numpy,length):
      x_numpy_reshape = x_numpy.cpu().numpy().reshape(-1,length).view(np.int16)
-     result = (x_numpy_reshape & 0xff00) + (x_numpy_reshape & 0x00ff)*flag
-    #  print("x_numpy_reshape",x_numpy_reshape.shape,x_numpy_reshape.dtype)
-    #  result_rolling = rolling(flag, x_numpy_reshape)
-    # #  print(result_rolling.shape, result_rolling.dtype)
-    #  result = ((x_numpy_reshape & result_rolling)*(~flag)) & ((x_numpy_reshape & 0xffff)*flag)
+    #  result = (x_numpy_reshape & 0xff00) + (x_numpy_reshape & 0x00ff)*flag
+    #  print("answer",x_numpy_reshape.dtype)
+     rolling_index = rolling(flag, x_numpy_reshape,7)
+    #
+    # print("result",rolling_index[0],rolling_index[0].shape,rolling_index[0].dtype)
+     result = (((x_numpy_reshape>=0) & x_numpy_reshape & rolling_index) + ((x_numpy_reshape<0) & x_numpy_reshape & rolling_index))*(~flag) + (x_numpy_reshape & 0xffff)*flag
      return torch.tensor(result.astype(np.int16))
      
 # gc.collect()
@@ -335,7 +335,7 @@ model = fuse_bn_recursively(models.resnet50(weights=models.ResNet50_Weights.IMAG
 def Quant(x : torch.Tensor, n : int) :
      
     N = 2 ** n
-    N_MIN, N_MAX = -N//2 + 1, N//2 - 1
+    N_MIN, N_MAX = -N//2 + 1 , N//2 - 1
     x_max, x_min = torch.max(x) , torch.min(x)
     x_max_abs = torch.abs(x_max)
     x_min_abs = torch.abs(x_min)
@@ -437,7 +437,7 @@ for name, layer in model.named_modules():
     if ("layer1" != name) | ("layer2" != name) | ("layer3" != name)| ("layer4" != name) :
         layer = dict([*model.named_modules()])[name]
         #if isinstance(layer, nn.ReLU):
-        layer.register_forward_pre_hook(save_outputs_hook(name))
+        # layer.register_forward_pre_hook(save_outputs_hook(name))
 
 length = 64
 for name, param in model.named_parameters():
@@ -451,24 +451,24 @@ for name, param in model.named_parameters():
         # Quant_input, scale, zero_p = Quant(param,16)
         # param[:] = DeQuant(Quant_input, scale, zero_p) 
         if shape_mul%64 != 0 :
-            Quant_input, scale, zero_p = quantize_channel(param,16)
-            param[:] = dequantize_channel(Quant_input, scale, zero_p)
-            # Quant_input, scale, zero_p = Quant(param,16)#quantize_channel(param,16)
-            # param[:] = DeQuant(Quant_input, scale, zero_p)#dequantize_channel(Comp_output, scale, zero_p)
+            # Quant_input, scale, zero_p = quantize_channel(param,16)
+            # param[:] = dequantize_channel(Quant_input, scale, zero_p)
+            Quant_input, scale, zero_p = Quant(param,16)#quantize_channel(param,16)
+            param[:] = DeQuant(Quant_input, scale, zero_p)#dequantize_channel(Comp_output, scale, zero_p)
             continue
 
         if 'bn' in name:
-            Quant_input, scale, zero_p = quantize_channel(param,16)
-            param[:] = dequantize_channel(Quant_input, scale, zero_p)
-            # Quant_input, scale, zero_p = Quant(param,16)#quantize_channel(param,16)
-            # param[:] = DeQuant(Quant_input, scale, zero_p)#dequantize_channel(Comp_output, scale, zero_p)
+            # Quant_input, scale, zero_p = quantize_channel(param,16)
+            # param[:] = dequantize_channel(Quant_input, scale, zero_p)
+            Quant_input, scale, zero_p = Quant(param,16)#quantize_channel(param,16)
+            param[:] = DeQuant(Quant_input, scale, zero_p)#dequantize_channel(Comp_output, scale, zero_p)
             continue
         
         if 'bias' in name:
-            Quant_input, scale, zero_p = quantize_channel(param,16)
-            param[:] = dequantize_channel(Quant_input, scale, zero_p)
-            # Quant_input, scale, zero_p = Quant(param,16)#quantize_channel(param,16)
-            # param[:] = DeQuant(Quant_input, scale, zero_p)#dequantize_channel(Comp_output, scale, zero_p)
+            # Quant_input, scale, zero_p = quantize_channel(param,16)
+            # param[:] = dequantize_channel(Quant_input, scale, zero_p)
+            Quant_input, scale, zero_p = Quant(param,16)#quantize_channel(param,16)
+            param[:] = DeQuant(Quant_input, scale, zero_p)#dequantize_channel(Comp_output, scale, zero_p)
 
             continue    
 
@@ -476,16 +476,10 @@ for name, param in model.named_parameters():
         # param[:] = DeQuant(Quant_input, scale, zero_p)
         # Quant_input, scale, zero_p = quantize_channel(param,16)                    
         Quant_input, scale, zero_p = Quant(param,16)#quantize_channel(param,16)
-        
-        plot(Quant_input)
-        # flag = Comp(Quant_input,length)
-        # Comp_output = Decomp(flag, Quant_input,length).reshape(Quant_input.shape)
-        
-        
-        # print(Quant_input[0][0])
-        # print(np.sum(flag.astype(np.int32)), len(flag.reshape(-1,)))
-        # print(name, param.shape, param.max(), param.min(), np.sum(flag.astype(np.int32)) / len(flag.reshape(-1,)))
-        
+        flag = Comp(Quant_input,length)
+
+        print(name, param.shape, param.max(), param.min(), np.sum(flag.astype(np.int32)) / len(flag.reshape(-1,)))
+        Comp_output = Decomp(flag, Quant_input,length).reshape(Quant_input.shape)
         # param[:] = dequantize_channel(Comp_output, scale, zero_p)
         param[:] = DeQuant(Comp_output, scale, zero_p)#dequantize_channel(Comp_output, scale, zero_p)
      
@@ -516,7 +510,3 @@ with torch.no_grad():
 
 print(acc1)
 
-
-# x = torch.Tensor([[[1,2,4,8,16,32,64,256,512,1024],[0,0,0,0,0,0,0,0,0,0],[0,0,0,0,0,0,0,0,0,0]]*62,[[32000,32000,32000,32000,32000,32000,32000,32000,32000,32000]*64]])
-# y = Comp(x)
-# print(y)
