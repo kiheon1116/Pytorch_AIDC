@@ -5,14 +5,14 @@ import argparse
 def parse_argument():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--filename', default = '/home/kkh/pytorch/data/param_comp_data/')
+    parser.add_argument('--filename', default = '/home/kkh/pytorch/data/param_INT10/')
     return parser.parse_args()
 
 
 def main(args):
     #print(args.filename)
     index = np.load(args.filename).reshape(-1)
-    plt.xlabel("real value bit position n (2^n ~ 2^(n+7))\n")
+    plt.xlabel("real value bit position n (2^n ~ 2^(n+10))\n")
     plt.ylabel("counts")
     plt.xticks(range(1,12))
     plt.hist(index, bins = 11, range=(1,12) ,histtype='bar',align='left', rwidth=0.6)
