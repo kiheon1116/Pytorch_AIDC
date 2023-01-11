@@ -24,16 +24,16 @@ torch.backends.cudnn.benchmark = False
 
 np.set_printoptions(threshold=np.inf, linewidth=np.inf)
 
-def display_per_block(x_numpy,length,dtype):
-    x_numpy_shape = x_numpy.shape
-    # block 개수 는 length와 관련됨.
-    # (length/2)*INT16 => 64B기준(INT16*32), => int64로 두고 shape 추가
-    block_filter = np.zeros((length, x_numpy_shape[0],x_numpy_shape[1]), dtype = np.int16)
-    for cnt in range(length):
-        block_filter[cnt] = np.arange(length) < (length - cnt)
-    print(x_numpy.shape)
-    
-    
+def display_per_block(x,length,value,select_block_index):
+    x_numpy = x.numpy()
+    x_shape = x_numpy.shape
+    x_2D = x_numpy.reshape(-1,length)
+    selected_value = x_2D[:,select_block_index]
+    x_2D[:,select_block_index] = selected_value & value
+    x_result = x_2D.reshape(x_shape)
+    return x_result
+
+
 # input : tensor(numpy array)[-1,64] --> output : flag(numpy array)[]
 # (block(16word * 64) * n개) => [-1,64], 1개당 int16
 def SR(x, length):
@@ -389,28 +389,6 @@ def shift_to_mask(x_torch, dtype):
     offset_block = torch.sum(mask_flag * offset.reshape(-1,1,1), dim=0)
     # return mask_block.type(torch.int16), offset_block.type(torch.int16) # for Comp(lossy)
     return mask_block.type(torch.int16).cuda(), offset_block.type(torch.int16).cuda() # for lossless+lossy
-    
-    # # 1000
-    # if(dtype==7):
-    #     mask_block = ((mask_m1*0xffff)+(mask_m2*0xffff)+(mask_m3*0xfffe)+(mask_m4*0xfffc)+(mask_m5*0xfff8)+(mask_m6*0xfff0)+(mask_m7*0xffe0)+(mask_m8*0xffc0)+(mask_m9*0xff10)+(mask_m10*0xff00))
-    # elif(dtype==8):
-    #     mask_block = ((mask_m1*0xffff)+(mask_m2*0xffff)+(mask_m3*0xfffe)+(mask_m4*0xfffc)+(mask_m5*0xfff8)+(mask_m6*0xfff0)+(mask_m7*0xffe0)+(mask_m8*0xffc0)+(mask_m9*0xff10))
-    # elif(dtype==9):
-    #     mask_block = ((mask_m1*0xffff)+(mask_m2*0xffff)+(mask_m3*0xfffe)+(mask_m4*0xfffc)+(mask_m5*0xfff8)+(mask_m6*0xfff0)+(mask_m7*0xffe0)+(mask_m8*0xffc0))
-    # elif(dtype==10):
-    #     mask_block = ((mask_m1*0xffff)+(mask_m2*0xffff)+(mask_m3*0xfffe)+(mask_m4*0xfffc)+(mask_m5*0xfff8)+(mask_m6*0xfff0)+(mask_m7*0xffe0))
-    # elif(dtype==11):
-    #     mask_block = ((mask_m1*0xffff)+(mask_m2*0xffff)+(mask_m3*0xfffe)+(mask_m4*0xfffc)+(mask_m5*0xfff8)+(mask_m6*0xfff0))
-    # elif(dtype==12):
-    #     mask_block = ((mask_m1*0xffff)+(mask_m2*0xffff)+(mask_m3*0xfffe)+(mask_m4*0xfffc)+(mask_m5*0xfff8))
-    # elif(dtype==13):
-    #     mask_block = ((mask_m1*0xffff)+(mask_m2*0xffff)+(mask_m3*0xfffe)+(mask_m4*0xfffc))
-    # elif(dtype==14):
-    #     mask_block = ((mask_m1*0xffff)+(mask_m2*0xffff)+(mask_m3*0xfffe))
-    # elif(dtype==15):
-    #     mask_block = ((mask_m1*0xffff)+(mask_m2*0xffff))
-    
-    # return mask_block.type(torch.int16)  
 
 # mask = [0x80,0xC0,0xE0,0xF0,0xF8,0xFC,0xFE,0xFF]
 def Decomp(x_numpy, flag, mask_block, offset_block, length):
@@ -533,108 +511,110 @@ def save_outputs_hook(layer_id) -> Callable:
 length = 32
 count = 1
 dtype = 10
-# d_type = [7,8,9,10,11,12,13,14,15]
-# for dtype in d_type:
-# model = fuse_bn_recursively(models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)).to('cuda')
-model = fuse_bn_recursively(models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)).to('cuda')
+value_list = [-(1 << i) for i in range(16)] # -2 # 잘라내는 값 ex, -2 = 0xfe
+select_block_index = 0
+for index in range(length):
+    for value in value_list:
+        select_block_index = index
+        model = fuse_bn_recursively(models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)).to('cuda')
+        parameters_index = np.array([]).astype(np.int16)
+        for name, param in tqdm(model.named_parameters()):
+            Data_shape = param.shape
+            shape_mul = 1
+            for i in Data_shape:
+                shape_mul *= i
+            with torch.no_grad():
+                if shape_mul%64 != 0 :
+                    Quant_input, scale, zero_p = Quant(param,16)#quantize_channel(param,16)
+                    param[:] = DeQuant(Quant_input, scale, zero_p)#dequantize_channel(Comp_output, scale, zero_p)
+                    continue
 
-parameters_index = np.array([]).astype(np.int16)
-for name, param in tqdm(model.named_parameters()):
-    Data_shape = param.shape
-    shape_mul = 1
-    for i in Data_shape:
-        shape_mul *= i
-    with torch.no_grad():
-        if shape_mul%64 != 0 :
-            Quant_input, scale, zero_p = Quant(param,16)#quantize_channel(param,16)
-            param[:] = DeQuant(Quant_input, scale, zero_p)#dequantize_channel(Comp_output, scale, zero_p)
-            continue
+                if 'bn' in name:
+                    Quant_input, scale, zero_p = Quant(param,16)#quantize_channel(param,16)
+                    param[:] = DeQuant(Quant_input, scale, zero_p)#dequantize_channel(Comp_output, scale, zero_p)
+                    continue
 
-        if 'bn' in name:
-            Quant_input, scale, zero_p = Quant(param,16)#quantize_channel(param,16)
-            param[:] = DeQuant(Quant_input, scale, zero_p)#dequantize_channel(Comp_output, scale, zero_p)
-            continue
+                if 'bias' in name:
+                    Quant_input, scale, zero_p = Quant(param,16)#quantize_channel(param,16)
+                    param[:] = DeQuant(Quant_input, scale, zero_p)#dequantize_channel(Comp_output, scale, zero_p)
+                    continue
+                
+                # # Step 1 : Quantization (INT16)
+                Quant_input, scale, zero_p = Quant(param,16)#quantize_channel(param,16)         # input (294*32) INT16
+                Quant_input_shape = Quant_input.shape
+                # # print("input",Quant_input[0][1:5], Quant_input.shape, Quant_input.dtype)
+                
+                # Step 2 : rolling (shift)
+                shift_block = shift(Quant_input,length,count,dtype)        # shift (294*32) 4bit
+                mask_block, offset_block = shift_to_mask(shift_block,dtype)        # mask (294*32) INT16 
+                
+                # lossy+lossless 의 경우
+                Quant_input = (Quant_input.reshape(mask_block.shape) & mask_block+offset_block).reshape(Quant_input_shape)#+ offset_block
+                Quant_input = torch.from_numpy(display_per_block(Quant_input.cpu(),length,value,select_block_index)).to('cuda')
 
-        if 'bias' in name:
-            Quant_input, scale, zero_p = Quant(param,16)#quantize_channel(param,16)
-            param[:] = DeQuant(Quant_input, scale, zero_p)#dequantize_channel(Comp_output, scale, zero_p)
-            continue
-        
-        # # Step 1 : Quantization (INT16)
-        Quant_input, scale, zero_p = Quant(param,16)#quantize_channel(param,16)         # input (294*32) INT16
-        Quant_input_shape = Quant_input.shape
-        # # print("input",Quant_input[0][1:5], Quant_input.shape, Quant_input.dtype)
-        
-        # Step 2 : rolling (shift)
-        shift_block = shift(Quant_input,length,count,dtype)        # shift (294*32) 4bit
-        mask_block, offset_block = shift_to_mask(shift_block,dtype)        # mask (294*32) INT16 
+                #@ Test 3 : INT10일 때 2bit을 더 제거하기 위한 Quant_input 분포 파악.
+                # param_index = torch.abs(rolling_total(Quant_input, length, dtype))
+                # param_save = np.save("/home/kkh/pytorch/data/param_INT10/"+ name,param_index.cpu().numpy())
+                # parameters_index = np.append(parameters_index.reshape(-1,).tolist(),param_index.tolist()).astype(np.int16)
+
+
+                # # # Step 3 : Compression 
+                # flag = Comp(Quant_input,length)        # flag (294*1) bool
+                # flag_torch = torch.from_numpy(flag).to('cuda')
                     
-        # lossy+lossless 의 경우
-        Quant_input = (Quant_input.reshape(mask_block.shape) & mask_block+offset_block).reshape(Quant_input_shape)#+ offset_block
+                # # Step 4 : Decompression
+                # # Data_1 [(294*32)*INT7] +  Data_2 [(294)*32bit]
+                # Comp_output = Decomp(Quant_input, flag, mask_block.cpu(), offset_block.cpu(), length).reshape(Quant_input.shape)
+                # # print("output",Comp_output[0][1:5])
+                
+                #@ Test 1 : total param & param per layer
+                # param_index = torch.abs(rolling_total(Quant_input, length, dtype))
+                # param_save = np.save("/home/kkh/pytorch/data/param_data/"+ name,param_index.cpu().numpy())
+                # parameters_index = np.append(parameters_index.reshape(-1,).tolist(),param_index.tolist()).astype(np.int16)
+                
+                # #@ Test 2 : total comp_data & comp_data per layer
+                # param_comp_index = torch.abs(rolling_total(Comp_output.to('cuda'), length, dtype))
+                # param_save = np.save("/home/kkh/pytorch/data/param_comp_data/"+ name,param_comp_index.cpu().numpy())
+                # parameters_comp_index = np.append(parameters_index.reshape(-1,).tolist(),param_comp_index.tolist()).astype(np.int16)
 
-        #@ Test 3 : INT10일 때 2bit을 더 제거하기 위한 Quant_input 분포 파악.
-        # param_index = torch.abs(rolling_total(Quant_input, length, dtype))
-        # param_save = np.save("/home/kkh/pytorch/data/param_INT10/"+ name,param_index.cpu().numpy())
-        # parameters_index = np.append(parameters_index.reshape(-1,).tolist(),param_index.tolist()).astype(np.int16)
-
-
-        # # # Step 3 : Compression 
-        # flag = Comp(Quant_input,length)        # flag (294*1) bool
-        # flag_torch = torch.from_numpy(flag).to('cuda')
-            
-        # # Step 4 : Decompression
-        # # Data_1 [(294*32)*INT7] +  Data_2 [(294)*32bit]
-        # Comp_output = Decomp(Quant_input, flag, mask_block.cpu(), offset_block.cpu(), length).reshape(Quant_input.shape)
-        # # print("output",Comp_output[0][1:5])
-        
-        #@ Test 1 : total param & param per layer
-        # param_index = torch.abs(rolling_total(Quant_input, length, dtype))
-        # param_save = np.save("/home/kkh/pytorch/data/param_data/"+ name,param_index.cpu().numpy())
-        # parameters_index = np.append(parameters_index.reshape(-1,).tolist(),param_index.tolist()).astype(np.int16)
-        
-        # #@ Test 2 : total comp_data & comp_data per layer
-        # param_comp_index = torch.abs(rolling_total(Comp_output.to('cuda'), length, dtype))
-        # param_save = np.save("/home/kkh/pytorch/data/param_comp_data/"+ name,param_comp_index.cpu().numpy())
-        # parameters_comp_index = np.append(parameters_index.reshape(-1,).tolist(),param_comp_index.tolist()).astype(np.int16)
-
-        # # Step 5 : DeQuantization (INT16)
-        param[:] = DeQuant(Quant_input, scale, zero_p)#dequantize_channel(Comp_output, scale, zero_p)
-        # param[:] = DeQuant(Comp_output, scale, zero_p)#dequantize_channel(Comp_output, scale, zero_p)
+                # # Step 5 : DeQuantization (INT16)
+                param[:] = DeQuant(Quant_input, scale, zero_p)#dequantize_channel(Comp_output, scale, zero_p)
+                # param[:] = DeQuant(Comp_output, scale, zero_p)#dequantize_channel(Comp_output, scale, zero_p)
 
 
-        #@ Test print
-        # print(name, param.shape, param.max(), param.min(), np.sum(flag.astype(np.int32)) / len(flag.reshape(-1,)))
-        
-#@ Test 2 : total param
-# print("total",parameters_index.shape, parameters_index.dtype,"\n")
-# param_save = np.save("/home/kkh/pytorch/data/param_INT10_
-# block/total.weight",parameters_index)
-# param_save = np.save("/home/kkh/pytorch/data/param_comp_data/total.weight",parameters_comp_index)
+                #@ Test print
+                # print(name, param.shape, param.max(), param.min(), np.sum(flag.astype(np.int32)) / len(flag.reshape(-1,)))
+                
+        #@ Test 2 : total param
+        # print("total",parameters_index.shape, parameters_index.dtype,"\n")
+        # param_save = np.save("/home/kkh/pytorch/data/param_INT10_
+        # block/total.weight",parameters_index)
+        # param_save = np.save("/home/kkh/pytorch/data/param_comp_data/total.weight",parameters_comp_index)
 
-dataset = dsets.ImageFolder("/media/imagenet/val", models.ResNet50_Weights.IMAGENET1K_V1.transforms()) ### 2번째 인자, transform
-loader = DataLoader(dataset= dataset, # dataset
-                batch_size= 128,   # batch size power to 2
-                shuffle = False, # false
-                num_workers = 8, # num_workers
-                pin_memory=True) # pin_memory
+        dataset = dsets.ImageFolder("/media/imagenet/val", models.ResNet50_Weights.IMAGENET1K_V1.transforms()) ### 2번째 인자, transform
+        loader = DataLoader(dataset= dataset, # dataset
+                        batch_size= 128,   # batch size power to 2
+                        shuffle = False, # false
+                        num_workers = 8, # num_workers
+                        pin_memory=True) # pin_memory
 
-correct = 0
-total = 50000
-accum = 0
-model.eval()
-# torch.no_grad()
-with torch.no_grad():
-    for idx, (input, label) in enumerate(tqdm(loader)):
-        input = input.cuda(non_blocking=True)
-        label = label.cuda(non_blocking=True)
-        output = model(input)
-        # print(output)
-        pred = torch.argmax(output, 1)
-        correct += (pred == label).int().sum()
-        accum += 4
-        if idx % 1000 == 0:
-            print(idx, correct /accum * 100, correct, accum)
-        acc1 = correct / total * 100
-print("data_type",dtype)
-print(acc1)
+        correct = 0
+        total = 50000
+        accum = 0
+        model.eval()
+        # torch.no_grad()
+        with torch.no_grad():
+            for idx, (input, label) in enumerate(tqdm(loader)):
+                input = input.cuda(non_blocking=True)
+                label = label.cuda(non_blocking=True)
+                output = model(input)
+                # print(output)
+                pred = torch.argmax(output, 1)
+                correct += (pred == label).int().sum()
+                accum += 4
+                if idx % 1000 == 0:
+                    print(idx, correct /accum * 100, correct, accum)
+                acc1 = correct / total * 100
+        print("value :",value, "select_index :",select_block_index)
+        print(acc1)
 # %%
